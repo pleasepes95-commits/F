@@ -1,103 +1,117 @@
 /*
     plugins/smoke_projectile.sma
-    Stage 1..3 - Projectile + Smoke Entity + 24 Sprite data per smoke
+    Rewritten AMX/Pawn-compatible plugin (Stage 1..3)
 
-    Goals implemented in this file:
-    - Projectile creation/movement/explosion (Phase 1)
-    - Create a single smoke entity per explosion and a smoke_think (Phase 2)
-    - Each smoke holds 24 "sprites" as DATA (no visible rendering yet) using a Fibonacci sphere distribution (Phase 3)
-    - Expansion, Breathing (natural motion), Fade-in / Fade-out implemented inside the single smoke_think (Phase 4/5)
-    - Cleanup of expired smokes and full memory clear (Phase 8 cleanup requirement)
+    - Fully AMX-compatible function names and patterns as requested.
+    - Projectile: press +smoke / release -smoke -> projectile follows crosshair and explodes.
+    - Smoke entity: single info_target with classname "valorant_smoke" acts as thinker.
+    - 24 SPRITES per smoke stored as DATA; directions computed with Fibonacci sphere.
+    - smoke_think updates: Expand, Breathing, Fade-in/Fade-out, Cleanup.
+    - No per-sprite Thinks. Prepared for future conversion to env_sprite rendering.
 
-    Performance notes:
-    - Single thinker per smoke entity. No per-sprite Thinks.
-    - Only active smokes are iterated in smoke_think. Sprite loops run only for active smokes.
-    - Precompute base directions (Fibonacci sphere) at smoke creation to avoid expensive math every Tick.
+    Notes:
+    - Uses pev(...) to read player origin/angles (pev_v_origin / pev_v_angle).
+    - Uses angle_vector native to compute forward vector from angles.
+    - Uses entity_set_origin(ent, origin) with Float origin[3].
+    - Uses floatsqroot for sqrt and max_f where needed.
+    - Small helper RandomFloat implemented using random_float if available.
 
-    Usage:
-    - bind "c" "+smoke" (press/hold/release)
-    - plugin registers +smoke / -smoke commands
-
-    Future phases will convert sprite DATA -> engine sprites/entities for rendering and AddToFullPack visibility handling.
+    Test:
+    - Place in plugins/, add to plugins.ini, restart server.
+    - bind "c" "+smoke" then press/hold/release to deploy.
 */
 
+#include <amxmodx>
+#include <fakemeta>
+
 #define PLUGIN_NAME "smoke_projectile"
-#define PLUGIN_VERSION "0.3"
+#define PLUGIN_VERSION "0.4"
 
 #define MAX_PLAYERS 32
 #define MAX_SMOKES 64
 #define SPRITE_COUNT 24
 
-// Projectile settings
-#define PROJ_SPEED 900.0    // units per second
-#define TASK_INTERVAL 0.02  // seconds per update (50 Hz)
-#define MAX_RANGE 1400.0    // max travel distance before auto-explode
+#define PROJ_SPEED 900.0
+#define PROJ_TASK_INTERVAL 0.02
+#define PROJ_MAX_RANGE 1400.0
 
-// Smoke core lifetime (data only)
-#define SMOKE_LIFETIME 15.0 // seconds
+#define SMOKE_LIFETIME 15.0
+#define SMOKE_THINK_INTERVAL 0.05
+#define FADE_IN_TIME 0.5
+#define FADE_OUT_TIME 2.0
 
-// Smoke behavior defaults
-#define DEFAULT_RADIUS_TARGET 200.0  // target radius units
-#define DEFAULT_EXPAND_RATE 40.0     // units per second (approach rate)
-#define DEFAULT_BREATHING_AMP 12.0   // units
-#define DEFAULT_BREATHING_SPEED 1.8  // cycles per second
-#define FADE_IN_TIME 0.5             // seconds
-#define FADE_OUT_TIME 2.0            // last seconds to fade out
+#define DEFAULT_RADIUS_TARGET 200.0
+#define DEFAULT_EXPAND_RATE   40.0
+#define DEFAULT_BREATH_AMP    12.0
+#define DEFAULT_BREATH_SPEED  1.8
 
-// Global projectile data (one projectile per player max)
-new bool:g_bProjActive[MAX_PLAYERS+1];
-new Float:g_fProjPos[MAX_PLAYERS+1][3];
-new Float:g_fProjVel[MAX_PLAYERS+1][3];
-new Float:g_fProjStartPos[MAX_PLAYERS+1][3];
-new Float:g_fProjTraveled[MAX_PLAYERS+1];
-new g_iProjTask = -1;
+// Projectile data (one per player)
+new bool:g_proj_active[MAX_PLAYERS+1];
+new Float:g_proj_pos[MAX_PLAYERS+1][3];
+new Float:g_proj_vel[MAX_PLAYERS+1][3];
+new Float:g_proj_start[MAX_PLAYERS+1][3];
+new Float:g_proj_travel[MAX_PLAYERS+1];
+new g_proj_task = -1;
 
-// Smoke core storage (data-only)
-new bool:g_bSmokeActive[MAX_SMOKES];
-new Float:g_fSmokeOrigin[MAX_SMOKES][3];
-new Float:g_fSmokeCreateTime[MAX_SMOKES];
-new Float:g_fSmokeExpireTime[MAX_SMOKES];
-new g_iSmokeOwner[MAX_SMOKES];
-new g_iSmokeEntity[MAX_SMOKES]; // entity index (info_target)
+// Smoke data
+new bool:g_smoke_active[MAX_SMOKES];
+new Float:g_smoke_origin[MAX_SMOKES][3];
+new Float:g_smoke_create[MAX_SMOKES];
+new Float:g_smoke_expire[MAX_SMOKES];
+new g_smoke_owner[MAX_SMOKES];
+new g_smoke_entity[MAX_SMOKES];
+new Float:g_smoke_lastthink[MAX_SMOKES];
 
-// Smoke runtime parameters
-new Float:g_fSmokeRadiusCurrent[MAX_SMOKES];
-new Float:g_fSmokeRadiusTarget[MAX_SMOKES];
-new Float:g_fSmokeExpandRate[MAX_SMOKES];
-new Float:g_fSmokeBreathingAmp[MAX_SMOKES];
-new Float:g_fSmokeBreathingSpeed[MAX_SMOKES];
+new Float:g_smoke_radius_cur[MAX_SMOKES];
+new Float:g_smoke_radius_target[MAX_SMOKES];
+new Float:g_smoke_expand_rate[MAX_SMOKES];
+new Float:g_smoke_breath_amp[MAX_SMOKES];
+new Float:g_smoke_breath_speed[MAX_SMOKES];
 
-// Precomputed directions for sprites (Fibonacci sphere) per smoke
-new Float:g_fSmokeDirs[MAX_SMOKES][SPRITE_COUNT][3];
+// Fibonacci directions per smoke
+new Float:g_smoke_dir[MAX_SMOKES][SPRITE_COUNT][3];
 
-// Sprite data per smoke (DATA ONLY). Each sprite has position offset, scale, alpha seeds
-new Float:g_fSpritePos[MAX_SMOKES][SPRITE_COUNT][3];
-new Float:g_fSpriteScale[MAX_SMOKES][SPRITE_COUNT];
-new Float:g_fSpriteAlpha[MAX_SMOKES][SPRITE_COUNT];
-new Float:g_fSpriteSeed[MAX_SMOKES][SPRITE_COUNT]; // small random per-sprite seed for noise
+// Sprite DATA per smoke (no engine sprites yet)
+new Float:g_sprite_pos[MAX_SMOKES][SPRITE_COUNT][3];
+new Float:g_sprite_scale[MAX_SMOKES][SPRITE_COUNT];
+new Float:g_sprite_alpha[MAX_SMOKES][SPRITE_COUNT];
+new Float:g_sprite_seed[MAX_SMOKES][SPRITE_COUNT];
 
-// Forward declarations
-forward void:OnPlayerPressProj(id);
-forward void:OnPlayerReleaseProj(id);
-forward UpdateProjectiles();
-forward CreateSmokeEntity(Float:ox, Float:oy, Float:oz, ownerid);
-forward smoke_think(ent);
-forward GenerateFibonacciDirs(slot, count);
+// Forwards
+forward OnPlayerPress;
+forward OnPlayerRelease;
+forward UpdateProjectiles;
+forward CreateSmokeAt;
+forward smoke_think;
+forward GenerateFibonacci;
 
-public plugin_precache()
+// RandomFloat helper: prefer random_float native if available; otherwise fallback
+stock Float:RandomFloat(Float:lo, Float:hi)
 {
-    // nothing to precache yet (no models/sounds)
+    // AMX Mod X usually provides random_float, but in case it's absent, use native random
+    #ifdef random_float
+        return random_float(lo, hi);
+    #else
+        new rnd = random(10000);
+        return lo + float(rnd) * (hi - lo) / 10000.0;
+    #endif
+}
+
+stock Float:Clamp(Float:v, Float:lo, Float:hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
 }
 
 public plugin_init()
 {
-    register_clcmd("+smoke", "OnPlayerPressProj");
-    register_clcmd("-smoke", "OnPlayerReleaseProj");
+    register_clcmd("+smoke", "OnPlayerPress");
+    register_clcmd("-smoke", "OnPlayerRelease");
 
-    // start the global update task for projectiles
-    g_iProjTask = set_task(TASK_INTERVAL, "UpdateProjectiles", _, _, _, "");
+    g_proj_task = set_task(PROJ_TASK_INTERVAL, "UpdateProjectiles", _, _, _, "");
 
-    // register the think name so engine can call our smoke_think when an entity thinks
+    // register thinker name (best-effort; some builds require it)
     register_think("valorant_smoke", "smoke_think");
 
     log_event(true, PLUGIN_NAME " v" PLUGIN_VERSION " loaded.");
@@ -105,404 +119,304 @@ public plugin_init()
 
 public plugin_end()
 {
-    if (g_iProjTask != -1)
+    if (g_proj_task != -1)
     {
-        kill_task(g_iProjTask);
-        g_iProjTask = -1;
+        kill_task(g_proj_task);
+        g_proj_task = -1;
     }
 
-    // cleanup any remaining smoke entities (defensive)
+    // defensive cleanup
     for (new i = 0; i < MAX_SMOKES; i++)
     {
-        if (g_bSmokeActive[i] && g_iSmokeEntity[i] > 0)
+        if (g_smoke_active[i] && g_smoke_entity[i] > 0)
         {
-            remove_entity(g_iSmokeEntity[i]);
-            g_iSmokeEntity[i] = 0;
+            remove_entity(g_smoke_entity[i]);
+            g_smoke_entity[i] = 0;
         }
-        g_bSmokeActive[i] = false;
+        g_smoke_active[i] = false;
     }
 }
 
 public client_disconnect(id)
 {
-    if (g_bProjActive[id])
+    if (g_proj_active[id])
     {
         ExplodeProjectile(id);
     }
 }
 
-// Player pressed +smoke (should be bound by user: bind "c" "+smoke")
-public void:OnPlayerPressProj(id)
+// Player input handlers (AMX style)
+public OnPlayerPress(id)
 {
     if (!is_user_connected(id) || !is_user_alive(id)) return;
-    if (g_bProjActive[id]) return; // already have a proj
+    if (g_proj_active[id]) return;
 
     new Float:origin[3];
     new Float:angles[3];
-    get_user_origin(id, origin);
-    get_user_angles(id, angles);
 
-    // Compute forward vector from angles
+    // read player's origin & view angles via pev
+    pev(id, pev_v_origin, origin);
+    pev(id, pev_v_angle, angles);
+
+    // compute forward vector (angle_vector native)
     new Float:forward[3];
-    AngleVectors(angles, forward, _, _);
+    angle_vector(forward, angles);
 
-    // Start projectile a little in front of the player's eyes
-    g_fProjPos[id][0] = origin[0] + forward[0]*18.0;
-    g_fProjPos[id][1] = origin[1] + forward[1]*18.0;
-    g_fProjPos[id][2] = origin[2] + forward[2]*18.0 + 10.0; // eye offset
+    // spawn little ahead of eye
+    g_proj_pos[id][0] = origin[0] + forward[0]*18.0;
+    g_proj_pos[id][1] = origin[1] + forward[1]*18.0;
+    g_proj_pos[id][2] = origin[2] + forward[2]*18.0 + 10.0;
 
-    g_fProjVel[id][0] = forward[0] * PROJ_SPEED;
-    g_fProjVel[id][1] = forward[1] * PROJ_SPEED;
-    g_fProjVel[id][2] = forward[2] * PROJ_SPEED;
+    g_proj_vel[id][0] = forward[0] * PROJ_SPEED;
+    g_proj_vel[id][1] = forward[1] * PROJ_SPEED;
+    g_proj_vel[id][2] = forward[2] * PROJ_SPEED;
 
-    g_fProjStartPos[id][0] = g_fProjPos[id][0];
-    g_fProjStartPos[id][1] = g_fProjPos[id][1];
-    g_fProjStartPos[id][2] = g_fProjPos[id][2];
+    g_proj_start[id][0] = g_proj_pos[id][0];
+    g_proj_start[id][1] = g_proj_pos[id][1];
+    g_proj_start[id][2] = g_proj_pos[id][2];
 
-    g_fProjTraveled[id] = 0.0;
+    g_proj_travel[id] = 0.0;
+    g_proj_active[id] = true;
 
-    g_bProjActive[id] = true;
-
-    // Debug: notify player
-    client_print(id, print_console, "[Smoke] Projectile created. Release to deploy.");
+    client_print(id, print_console, "[smoke] Projectile created. Release to deploy.");
 }
 
-// Player released -smoke
-public void:OnPlayerReleaseProj(id)
+public OnPlayerRelease(id)
 {
     if (!is_user_connected(id)) return;
-    if (!g_bProjActive[id]) return;
+    if (!g_proj_active[id]) return;
 
     ExplodeProjectile(id);
 }
 
-// Explode projectile: create Smoke Entity and deactivate projectile
 public ExplodeProjectile(id)
 {
-    if (!g_bProjActive[id]) return 0;
+    if (!g_proj_active[id]) return 0;
 
-    new Float:ox = g_fProjPos[id][0];
-    new Float:oy = g_fProjPos[id][1];
-    new Float:oz = g_fProjPos[id][2];
+    new Float:ox = g_proj_pos[id][0];
+    new Float:oy = g_proj_pos[id][1];
+    new Float:oz = g_proj_pos[id][2];
 
-    CreateSmokeEntity(ox, oy, oz, id);
+    CreateSmokeAt(ox, oy, oz, id);
 
-    g_bProjActive[id] = false;
-    g_fProjTraveled[id] = 0.0;
+    g_proj_active[id] = false;
+    g_proj_travel[id] = 0.0;
 
-    // Debug
-    client_print(id, print_console, "[Smoke] Exploded and spawned Smoke entity (data-only with 24 sprites).");
-
+    client_print(id, print_console, "[smoke] Exploded and spawned smoke entity.");
     return 1;
 }
 
-// Create a smoke entity (info_target with classname valorant_smoke) and initialize 24 sprite DATA entries
-public CreateSmokeEntity(Float:ox, Float:oy, Float:oz, ownerid)
+// CreateSmokeAt: create data and thinker entity; precompute dirs and sprite seeds
+public CreateSmokeAt(Float:ox, Float:oy, Float:oz, owner)
 {
-    // find free smoke slot
-    new i;
-    for (i = 0; i < MAX_SMOKES; i++)
-    {
-        if (!g_bSmokeActive[i]) break;
-    }
-    if (i >= MAX_SMOKES) {
-        // recycle oldest (simple) - choose slot 0
-        i = 0;
-    }
+    new slot = -1;
+    for (new i = 0; i < MAX_SMOKES; i++) if (!g_smoke_active[i]) { slot = i; break; }
+    if (slot == -1) slot = 0; // recycle
 
-    // store basic data
-    g_bSmokeActive[i] = true;
-    g_fSmokeOrigin[i][0] = ox;
-    g_fSmokeOrigin[i][1] = oy;
-    g_fSmokeOrigin[i][2] = oz;
-    g_fSmokeCreateTime[i] = get_gametime();
-    g_fSmokeExpireTime[i] = g_fSmokeCreateTime[i] + SMOKE_LIFETIME;
-    g_iSmokeOwner[i] = ownerid;
+    g_smoke_active[slot] = true;
+    g_smoke_origin[slot][0] = ox;
+    g_smoke_origin[slot][1] = oy;
+    g_smoke_origin[slot][2] = oz;
+    g_smoke_create[slot] = get_gametime();
+    g_smoke_expire[slot] = g_smoke_create[slot] + SMOKE_LIFETIME;
+    g_smoke_owner[slot] = owner;
+    g_smoke_entity[slot] = 0;
+    g_smoke_lastthink[slot] = g_smoke_create[slot];
 
-    // runtime parameters (can be tuned later)
-    g_fSmokeRadiusCurrent[i] = 8.0; // small initial radius
-    g_fSmokeRadiusTarget[i] = DEFAULT_RADIUS_TARGET;
-    g_fSmokeExpandRate[i] = DEFAULT_EXPAND_RATE;
-    g_fSmokeBreathingAmp[i] = DEFAULT_BREATHING_AMP;
-    g_fSmokeBreathingSpeed[i] = DEFAULT_BREATHING_SPEED;
+    g_smoke_radius_cur[slot] = 8.0;
+    g_smoke_radius_target[slot] = DEFAULT_RADIUS_TARGET;
+    g_smoke_expand_rate[slot] = DEFAULT_EXPAND_RATE;
+    g_smoke_breath_amp[slot] = DEFAULT_BREATH_AMP;
+    g_smoke_breath_speed[slot] = DEFAULT_BREATH_SPEED;
 
-    // Precompute 24 directions using Fibonacci sphere
-    GenerateFibonacciDirs(i, SPRITE_COUNT);
+    // precompute directions
+    GenerateFibonacci(slot, SPRITE_COUNT);
 
-    // initialize per-sprite seeds and baseline values (no engine sprites created yet)
-    new Float:now = g_fSmokeCreateTime[i];
+    // init sprite data
     for (new s = 0; s < SPRITE_COUNT; s++)
     {
-        g_fSpriteSeed[i][s] = random_float(0.0, 6.2831853); // random phase
-        g_fSpriteScale[i][s] = random_float(0.85, 1.20);
-        g_fSpriteAlpha[i][s] = 0.0; // will be updated by fade-in
-        // initial positions at origin
-        g_fSpritePos[i][s][0] = ox;
-        g_fSpritePos[i][s][1] = oy;
-        g_fSpritePos[i][s][2] = oz;
+        g_sprite_seed[slot][s] = RandomFloat(0.0, 6.2831853);
+        g_sprite_scale[slot][s] = RandomFloat(0.9, 1.15);
+        g_sprite_alpha[slot][s] = 0.0;
+        g_sprite_pos[slot][s][0] = ox;
+        g_sprite_pos[slot][s][1] = oy;
+        g_sprite_pos[slot][s][2] = oz;
     }
 
-    // Create a lightweight entity as the single thinker for this smoke
+    // create thinker entity
     new ent = create_entity("info_target");
     if (ent <= 0)
     {
-        server_print("[Smoke] Failed to create entity for smoke %d", i);
-        // still keep data-only smoke but with no thinker - it will not update
-        g_iSmokeEntity[i] = 0;
-        return i;
+        server_print("[smoke] Failed to create thinker entity for slot %d", slot);
+        g_smoke_entity[slot] = 0;
+        return slot;
     }
 
     entity_set_string(ent, EV_SZ_classname, "valorant_smoke");
-    entity_set_origin(ent, ox, oy, oz);
-    entity_set_float(ent, EV_FL_nextthink, get_gametime() + 0.05);
 
-    g_iSmokeEntity[i] = ent;
+    // entity_set_origin expects an array of floats in some AMX versions
+    new Float:entOrigin[3];
+    entOrigin[0] = ox; entOrigin[1] = oy; entOrigin[2] = oz;
+    entity_set_origin(ent, entOrigin);
 
-    server_print("[Smoke] Initialized smoke slot %d with %d sprites at (%.1f, %.1f, %.1f)", i, SPRITE_COUNT, ox, oy, oz);
+    entity_set_float(ent, EV_FL_nextthink, get_gametime() + SMOKE_THINK_INTERVAL);
+    g_smoke_entity[slot] = ent;
 
-    return i;
+    server_print("[smoke] Spawned smoke slot %d at (%.1f, %.1f, %.1f)", slot, ox, oy, oz);
+    return slot;
 }
 
-// Fibonacci sphere: fill g_fSmokeDirs[slot][0..count-1][3]
-public GenerateFibonacciDirs(slot, count)
+// Fibonacci sphere generators
+public GenerateFibonacci(slot, count)
 {
-    // golden angle
-    new Float:phi = 3.14159265358979323846 * (3.0 - sqrt(5.0)); // ~2.399963
-
+    new Float:phi = 3.14159265358979323846 * (3.0 - sqrtf(5.0));
     if (count <= 0) return;
 
+    new Float:den = float(max(1, count - 1));
     for (new k = 0; k < count; k++)
     {
         new Float:idx = float(k);
-        new Float:nm1 = float(count - 1);
-        new Float:z = 1.0 - (2.0 * idx) / nm1; // z ranges from 1..-1
-        new Float:r = floatsqrt(max_f(0.0, 1.0 - z*z));
+        new Float:z = 1.0 - (2.0 * idx) / den; // from 1 to -1
+        new Float:r = floatsqroot(max_f(0.0, 1.0 - z*z));
         new Float:theta = phi * idx;
         new Float:x = r * floatcos(theta);
         new Float:y = r * floatsin(theta);
-
-        // store normalized direction
-        g_fSmokeDirs[slot][k][0] = x;
-        g_fSmokeDirs[slot][k][1] = y;
-        g_fSmokeDirs[slot][k][2] = z;
+        g_smoke_dir[slot][k][0] = x;
+        g_smoke_dir[slot][k][1] = y;
+        g_smoke_dir[slot][k][2] = z;
     }
 }
 
-// smoke_think: single thinker updating all sprite DATA for this entity's smoke slot
+// smoke_think: updates all sprite DATA for the smoke, does Expand/Breath/Fade, cleanup
 public smoke_think(ent)
 {
-    if (!is_valid_ent(ent))
-    {
-        return;
-    }
+    if (!is_valid_ent(ent)) return;
 
-    // find which slot corresponds to this entity
     new slot = -1;
-    for (new i = 0; i < MAX_SMOKES; i++)
-    {
-        if (g_bSmokeActive[i] && g_iSmokeEntity[i] == ent)
-        {
-            slot = i;
-            break;
-        }
-    }
+    for (new i = 0; i < MAX_SMOKES; i++) if (g_smoke_active[i] && g_smoke_entity[i] == ent) { slot = i; break; }
 
     new Float:now = get_gametime();
-
     if (slot == -1)
     {
-        // unknown entity - schedule nextthink and return
-        entity_set_float(ent, EV_FL_nextthink, now + 0.05);
+        entity_set_float(ent, EV_FL_nextthink, now + SMOKE_THINK_INTERVAL);
         return;
     }
 
-    // Expiration check
-    if (now >= g_fSmokeExpireTime[slot])
+    if (now >= g_smoke_expire[slot])
     {
-        // cleanup data and remove entity
         remove_entity(ent);
-
-        // clear data arrays for safety
+        // clear arrays
         for (new s = 0; s < SPRITE_COUNT; s++)
         {
-            g_fSpritePos[slot][s][0] = 0.0;
-            g_fSpritePos[slot][s][1] = 0.0;
-            g_fSpritePos[slot][s][2] = 0.0;
-            g_fSpriteScale[slot][s] = 0.0;
-            g_fSpriteAlpha[slot][s] = 0.0;
-            g_fSpriteSeed[slot][s] = 0.0;
+            g_sprite_pos[slot][s][0] = 0.0;
+            g_sprite_pos[slot][s][1] = 0.0;
+            g_sprite_pos[slot][s][2] = 0.0;
+            g_sprite_scale[slot][s] = 0.0;
+            g_sprite_alpha[slot][s] = 0.0;
+            g_sprite_seed[slot][s] = 0.0;
         }
-
-        g_bSmokeActive[slot] = false;
-        g_iSmokeEntity[slot] = 0;
-
-        server_print("[Smoke] Slot %d expired and cleaned up.", slot);
+        g_smoke_active[slot] = false;
+        g_smoke_entity[slot] = 0;
+        server_print("[smoke] Slot %d expired and cleaned.", slot);
         return;
     }
 
-    // Compute progression and fade
-    new Float:age = now - g_fSmokeCreateTime[slot];
-    new Float:lifetime = g_fSmokeExpireTime[slot] - g_fSmokeCreateTime[slot];
-    new Float:fadeFactor = 1.0;
+    // compute dt safely
+    new Float:dt = now - g_smoke_lastthink[slot];
+    if (dt <= 0.0) dt = SMOKE_THINK_INTERVAL;
+    g_smoke_lastthink[slot] = now;
 
-    // Fade in
-    if (age < FADE_IN_TIME)
-    {
-        fadeFactor = age / FADE_IN_TIME;
-    }
-    // Fade out
-    else if (now > (g_fSmokeExpireTime[slot] - FADE_OUT_TIME))
-    {
-        new Float:remaining = g_fSmokeExpireTime[slot] - now;
-        fadeFactor = max_f(0.0, remaining / FADE_OUT_TIME);
-    }
+    new Float:age = now - g_smoke_create[slot];
+    new Float:fade = 1.0;
+    if (age < FADE_IN_TIME) { fade = Clamp(age / FADE_IN_TIME, 0.0, 1.0); }
+    else if (now > (g_smoke_expire[slot] - FADE_OUT_TIME)) { new Float:rem = g_smoke_expire[slot] - now; fade = Clamp(rem / FADE_OUT_TIME, 0.0, 1.0); }
 
-    // Update expansion: approach target radius
-    new Float:radiusNow = g_fSmokeRadiusCurrent[slot];
-    new Float:target = g_fSmokeRadiusTarget[slot];
-    new Float:rate = g_fSmokeExpandRate[slot];
+    // expand toward target
+    new Float:cur = g_smoke_radius_cur[slot];
+    new Float:target = g_smoke_radius_target[slot];
+    new Float:rate = g_smoke_expand_rate[slot];
+    if (cur < target) { cur += rate * dt; if (cur > target) cur = target; }
+    else if (cur > target) { cur -= rate * dt; if (cur < target) cur = target; }
+    g_smoke_radius_cur[slot] = cur;
 
-    new Float:dt = 0.05; // match our nextthink interval (50ms)
-    // approach: simple linear step toward target (stable and cheap)
-    if (radiusNow < target)
-    {
-        radiusNow += rate * dt;
-        if (radiusNow > target) radiusNow = target;
-    }
-    else if (radiusNow > target)
-    {
-        radiusNow -= rate * dt;
-        if (radiusNow < target) radiusNow = target;
-    }
-    g_fSmokeRadiusCurrent[slot] = radiusNow;
+    // breathing
+    new Float:breath = g_smoke_breath_amp[slot] * floatsin(age * g_smoke_breath_speed[slot]);
 
-    // Breathing (sinusoidal) - natural gas motion
-    new Float:breathing = g_fSmokeBreathingAmp[slot] * floatsin((age * g_fSmokeBreathingSpeed[slot]) + 0.0);
-
-    // Per-sprite update (DATA only). This loop runs only for active smoke slot.
+    // update sprite DATA
     for (new s = 0; s < SPRITE_COUNT; s++)
     {
-        // small deterministic noise using seed
-        new Float:seed = g_fSpriteSeed[slot][s];
-        new Float:noise = floatsin(seed + age * 1.3) * 3.0; // small jitter
+        new Float:seed = g_sprite_seed[slot][s];
+        new Float:noise = floatsin(seed + age * 1.3) * 3.0;
+        new Float:dist = cur + breath + noise;
 
-        // final offset distance for this sprite
-        new Float:dist = radiusNow + breathing + noise;
+        new Float:dx = g_smoke_dir[slot][s][0];
+        new Float:dy = g_smoke_dir[slot][s][1];
+        new Float:dz = g_smoke_dir[slot][s][2];
 
-        // direction from precomputed dirs
-        new Float:dx = g_fSmokeDirs[slot][s][0];
-        new Float:dy = g_fSmokeDirs[slot][s][1];
-        new Float:dz = g_fSmokeDirs[slot][s][2];
+        g_sprite_pos[slot][s][0] = g_smoke_origin[slot][0] + dx * dist;
+        g_sprite_pos[slot][s][1] = g_smoke_origin[slot][1] + dy * dist;
+        g_sprite_pos[slot][s][2] = g_smoke_origin[slot][2] + dz * dist;
 
-        // position = origin + dir * dist
-        g_fSpritePos[slot][s][0] = g_fSmokeOrigin[slot][0] + dx * dist;
-        g_fSpritePos[slot][s][1] = g_fSmokeOrigin[slot][1] + dy * dist;
-        g_fSpritePos[slot][s][2] = g_fSmokeOrigin[slot][2] + dz * dist;
-
-        // scale and alpha affected by fadeFactor and small random factor
-        g_fSpriteScale[slot][s] = g_fSpriteScale[slot][s] * 0.0 + (0.5 * g_fSpriteScale[slot][s] + 0.5); // keep seed-based value while allowing future adjustments
-        // For now set alpha as fadeFactor * base (base=0.9)
-        g_fSpriteAlpha[slot][s] = 0.9 * fadeFactor;
+        // scale/alpha
+        // keep seed scale, alpha follows fade (base 0.9)
+        g_sprite_alpha[slot][s] = 0.9 * fade;
     }
 
-    // Reschedule next think (keep interval stable)
-    entity_set_float(ent, EV_FL_nextthink, now + 0.05);
+    entity_set_float(ent, EV_FL_nextthink, now + SMOKE_THINK_INTERVAL);
 }
 
-// Global update task: moves all active projectiles. Single task -> Phase 7 ready.
+// UpdateProjectiles - global task
 public UpdateProjectiles()
 {
-    // We'll use TASK_INTERVAL as our dt
-    new Float:dt = TASK_INTERVAL;
+    new Float:dt = PROJ_TASK_INTERVAL;
 
     for (new id = 1; id <= get_maxplayers(); id++)
     {
         if (!is_user_connected(id)) continue;
+        if (!g_proj_active[id]) continue;
 
-        if (g_bProjActive[id])
+        // update forward based on player's view
+        if (is_user_alive(id))
         {
-            // Update projectile direction to follow player's crosshair
-            if (is_user_alive(id))
-            {
-                new Float:angles[3];
-                get_user_angles(id, angles);
-                new Float:forward[3];
-                AngleVectors(angles, forward, _, _);
-
-                // update velocity to follow the crosshair
-                g_fProjVel[id][0] = forward[0] * PROJ_SPEED;
-                g_fProjVel[id][1] = forward[1] * PROJ_SPEED;
-                g_fProjVel[id][2] = forward[2] * PROJ_SPEED;
-            }
-
-            // Move projectile
-            g_fProjPos[id][0] += g_fProjVel[id][0] * dt;
-            g_fProjPos[id][1] += g_fProjVel[id][1] * dt;
-            g_fProjPos[id][2] += g_fProjVel[id][2] * dt;
-
-            // Track distance traveled
-            new Float:dx = g_fProjPos[id][0] - g_fProjStartPos[id][0];
-            new Float:dy = g_fProjPos[id][1] - g_fProjStartPos[id][1];
-            new Float:dz = g_fProjPos[id][2] - g_fProjStartPos[id][2];
-            new Float:dist = floatsqrt(dx*dx + dy*dy + dz*dz);
-            g_fProjTraveled[id] = dist;
-
-            // Simple collision approximation: if we've gone beyond MAX_RANGE, explode
-            if (dist >= MAX_RANGE)
-            {
-                ExplodeProjectile(id);
-                continue;
-            }
-
-            // TODO: add proper traceline collision in next iteration (server-side trace_line)
+            new Float:angles[3];
+            pev(id, pev_v_angle, angles);
+            new Float:forward[3];
+            angle_vector(forward, angles);
+            g_proj_vel[id][0] = forward[0] * PROJ_SPEED;
+            g_proj_vel[id][1] = forward[1] * PROJ_SPEED;
+            g_proj_vel[id][2] = forward[2] * PROJ_SPEED;
         }
+
+        g_proj_pos[id][0] += g_proj_vel[id][0] * dt;
+        g_proj_pos[id][1] += g_proj_vel[id][1] * dt;
+        g_proj_pos[id][2] += g_proj_vel[id][2] * dt;
+
+        new Float:dx = g_proj_pos[id][0] - g_proj_start[id][0];
+        new Float:dy = g_proj_pos[id][1] - g_proj_start[id][1];
+        new Float:dz = g_proj_pos[id][2] - g_proj_start[id][2];
+
+        new Float:dist = floatsqroot(dx*dx + dy*dy + dz*dz);
+        g_proj_travel[id] = dist;
+
+        if (dist >= PROJ_MAX_RANGE) { ExplodeProjectile(id); continue; }
+
+        // TODO: add traceline collision here in next iteration
     }
-
-    // task continues automatically
 }
 
-// Utility: compute forward/right/up from angles (degrees) -> vectors
-stock AngleVectors(const Float:angles[3], Float:forward[3], Float:right[3], Float:up[3])
-{
-    // angles are in degrees: angles[0]=pitch, angles[1]=yaw, angles[2]=roll
-    new Float:radpitch = angles[0] * (3.14159265 / 180.0);
-    new Float:radyaw   = angles[1] * (3.14159265 / 180.0);
-    new Float:sr = floatcos(radpitch);
-    new Float:sp = floatsin(radpitch);
-    new Float:cy = floatcos(radyaw);
-    new Float:sy = floatsin(radyaw);
-
-    if (forward)
-    {
-        forward[0] = sr * cy; // cos(pitch)*cos(yaw) approximation
-        forward[1] = sr * sy;
-        forward[2] = -sp;
-    }
-
-    // right and up not needed for this stage
-}
-
-// Helpers for printing
-stock server_print(const string[], {any,...})
-{
-    server_cmd(string, 0);
-}
-
-// Debug command to print active smoke & first sprite positions
+// Admin debug
 public command_smokelist(id)
 {
     if (!is_user_admin(id)) return 0;
-    client_print(id, print_console, "[Smoke] Active Smoke Cores and sample sprite positions:");
+    client_print(id, print_console, "[smoke] Active slots:");
     for (new i = 0; i < MAX_SMOKES; i++)
     {
-        if (g_bSmokeActive[i])
+        if (g_smoke_active[i])
         {
-            client_print(id, print_console, "%d: origin=(%.1f,%.1f,%.1f) age=%.1f slotEnt=%d", i, g_fSmokeOrigin[i][0], g_fSmokeOrigin[i][1], g_fSmokeOrigin[i][2], get_gametime()-g_fSmokeCreateTime[i], g_iSmokeEntity[i]);
-            // print first 3 sprite positions as sample
-            for (new s = 0; s < min(3, SPRITE_COUNT); s++)
-            {
-                client_print(id, print_console, "  sprite %d pos=(%.1f,%.1f,%.1f) alpha=%.2f scale=%.2f", s, g_fSpritePos[i][s][0], g_fSpritePos[i][s][1], g_fSpritePos[i][s][2], g_fSpriteAlpha[i][s], g_fSpriteScale[i][s]);
-            }
+            client_print(id, print_console, "%d: origin=(%.1f,%.1f,%.1f) age=%.1f ent=%d",
+                i, g_smoke_origin[i][0], g_smoke_origin[i][1], g_smoke_origin[i][2], get_gametime()-g_smoke_create[i], g_smoke_entity[i]);
+            client_print(id, print_console, "  sprite0 pos=(%.1f,%.1f,%.1f) alpha=%.2f", g_sprite_pos[i][0][0], g_sprite_pos[i][0][1], g_sprite_pos[i][0][2], g_sprite_alpha[i][0]);
         }
     }
+    return 1;
 }
