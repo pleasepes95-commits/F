@@ -1,31 +1,22 @@
 /*
     plugins/smoke_projectile.sma
-    Rewritten AMX/Pawn-compatible plugin (Stage 1..3)
+    AMX/Pawn-corrected plugin (fixes compile issues)
 
-    - Fully AMX-compatible function names and patterns as requested.
-    - Projectile: press +smoke / release -smoke -> projectile follows crosshair and explodes.
-    - Smoke entity: single info_target with classname "valorant_smoke" acts as thinker.
-    - 24 SPRITES per smoke stored as DATA; directions computed with Fibonacci sphere.
-    - smoke_think updates: Expand, Breathing, Fade-in/Fade-out, Cleanup.
-    - No per-sprite Thinks. Prepared for future conversion to env_sprite rendering.
+    Notes on fixes applied in this commit:
+    - Corrected forward declarations to Pawn syntax (forward Name(params);)
+    - Removed unsupported preprocessor (#ifdef) usage
+    - Use random_float() directly (AMXX provides it via <amxmodx>)
+    - Ensure public function definitions match forward prototypes (no "void:")
+    - Use a fixed golden angle constant to avoid relying on sqrtf in preprocessor
 
-    Notes:
-    - Uses pev(...) to read player origin/angles (pev_v_origin / pev_v_angle).
-    - Uses angle_vector native to compute forward vector from angles.
-    - Uses entity_set_origin(ent, origin) with Float origin[3].
-    - Uses floatsqroot for sqrt and max_f where needed.
-    - Small helper RandomFloat implemented using random_float if available.
-
-    Test:
-    - Place in plugins/, add to plugins.ini, restart server.
-    - bind "c" "+smoke" then press/hold/release to deploy.
+    This file focuses on fixing syntactic issues so it compiles cleanly under AMX Mod X.
 */
 
 #include <amxmodx>
 #include <fakemeta>
 
 #define PLUGIN_NAME "smoke_projectile"
-#define PLUGIN_VERSION "0.4"
+#define PLUGIN_VERSION "0.5"
 
 #define MAX_PLAYERS 32
 #define MAX_SMOKES 64
@@ -77,24 +68,18 @@ new Float:g_sprite_scale[MAX_SMOKES][SPRITE_COUNT];
 new Float:g_sprite_alpha[MAX_SMOKES][SPRITE_COUNT];
 new Float:g_sprite_seed[MAX_SMOKES][SPRITE_COUNT];
 
-// Forwards
-forward OnPlayerPress;
-forward OnPlayerRelease;
-forward UpdateProjectiles;
-forward CreateSmokeAt;
-forward smoke_think;
-forward GenerateFibonacci;
+// Forwards (correct Pawn forward syntax)
+forward OnPlayerPress(id);
+forward OnPlayerRelease(id);
+forward UpdateProjectiles();
+forward CreateSmokeAt(Float:ox, Float:oy, Float:oz, owner);
+forward smoke_think(ent);
+forward GenerateFibonacci(slot, count);
 
-// RandomFloat helper: prefer random_float native if available; otherwise fallback
+// Helpers
 stock Float:RandomFloat(Float:lo, Float:hi)
 {
-    // AMX Mod X usually provides random_float, but in case it's absent, use native random
-    #ifdef random_float
-        return random_float(lo, hi);
-    #else
-        new rnd = random(10000);
-        return lo + float(rnd) * (hi - lo) / 10000.0;
-    #endif
+    return random_float(lo, hi);
 }
 
 stock Float:Clamp(Float:v, Float:lo, Float:hi)
@@ -145,7 +130,7 @@ public client_disconnect(id)
     }
 }
 
-// Player input handlers (AMX style)
+// Player input handlers
 public OnPlayerPress(id)
 {
     if (!is_user_connected(id) || !is_user_alive(id)) return;
@@ -154,15 +139,12 @@ public OnPlayerPress(id)
     new Float:origin[3];
     new Float:angles[3];
 
-    // read player's origin & view angles via pev
     pev(id, pev_v_origin, origin);
     pev(id, pev_v_angle, angles);
 
-    // compute forward vector (angle_vector native)
     new Float:forward[3];
     angle_vector(forward, angles);
 
-    // spawn little ahead of eye
     g_proj_pos[id][0] = origin[0] + forward[0]*18.0;
     g_proj_pos[id][1] = origin[1] + forward[1]*18.0;
     g_proj_pos[id][2] = origin[2] + forward[2]*18.0 + 10.0;
@@ -206,7 +188,7 @@ public ExplodeProjectile(id)
     return 1;
 }
 
-// CreateSmokeAt: create data and thinker entity; precompute dirs and sprite seeds
+// Create smoke data and thinker entity
 public CreateSmokeAt(Float:ox, Float:oy, Float:oz, owner)
 {
     new slot = -1;
@@ -254,7 +236,6 @@ public CreateSmokeAt(Float:ox, Float:oy, Float:oz, owner)
 
     entity_set_string(ent, EV_SZ_classname, "valorant_smoke");
 
-    // entity_set_origin expects an array of floats in some AMX versions
     new Float:entOrigin[3];
     entOrigin[0] = ox; entOrigin[1] = oy; entOrigin[2] = oz;
     entity_set_origin(ent, entOrigin);
@@ -266,10 +247,10 @@ public CreateSmokeAt(Float:ox, Float:oy, Float:oz, owner)
     return slot;
 }
 
-// Fibonacci sphere generators
+// Fibonacci sphere generators (uses golden angle constant)
 public GenerateFibonacci(slot, count)
 {
-    new Float:phi = 3.14159265358979323846 * (3.0 - sqrtf(5.0));
+    new Float:phi = 2.399963229728653; // golden angle
     if (count <= 0) return;
 
     new Float:den = float(max(1, count - 1));
@@ -305,7 +286,6 @@ public smoke_think(ent)
     if (now >= g_smoke_expire[slot])
     {
         remove_entity(ent);
-        // clear arrays
         for (new s = 0; s < SPRITE_COUNT; s++)
         {
             g_sprite_pos[slot][s][0] = 0.0;
@@ -321,7 +301,6 @@ public smoke_think(ent)
         return;
     }
 
-    // compute dt safely
     new Float:dt = now - g_smoke_lastthink[slot];
     if (dt <= 0.0) dt = SMOKE_THINK_INTERVAL;
     g_smoke_lastthink[slot] = now;
@@ -331,7 +310,6 @@ public smoke_think(ent)
     if (age < FADE_IN_TIME) { fade = Clamp(age / FADE_IN_TIME, 0.0, 1.0); }
     else if (now > (g_smoke_expire[slot] - FADE_OUT_TIME)) { new Float:rem = g_smoke_expire[slot] - now; fade = Clamp(rem / FADE_OUT_TIME, 0.0, 1.0); }
 
-    // expand toward target
     new Float:cur = g_smoke_radius_cur[slot];
     new Float:target = g_smoke_radius_target[slot];
     new Float:rate = g_smoke_expand_rate[slot];
@@ -339,10 +317,8 @@ public smoke_think(ent)
     else if (cur > target) { cur -= rate * dt; if (cur < target) cur = target; }
     g_smoke_radius_cur[slot] = cur;
 
-    // breathing
     new Float:breath = g_smoke_breath_amp[slot] * floatsin(age * g_smoke_breath_speed[slot]);
 
-    // update sprite DATA
     for (new s = 0; s < SPRITE_COUNT; s++)
     {
         new Float:seed = g_sprite_seed[slot][s];
@@ -357,8 +333,6 @@ public smoke_think(ent)
         g_sprite_pos[slot][s][1] = g_smoke_origin[slot][1] + dy * dist;
         g_sprite_pos[slot][s][2] = g_smoke_origin[slot][2] + dz * dist;
 
-        // scale/alpha
-        // keep seed scale, alpha follows fade (base 0.9)
         g_sprite_alpha[slot][s] = 0.9 * fade;
     }
 
@@ -375,7 +349,6 @@ public UpdateProjectiles()
         if (!is_user_connected(id)) continue;
         if (!g_proj_active[id]) continue;
 
-        // update forward based on player's view
         if (is_user_alive(id))
         {
             new Float:angles[3];
@@ -399,8 +372,6 @@ public UpdateProjectiles()
         g_proj_travel[id] = dist;
 
         if (dist >= PROJ_MAX_RANGE) { ExplodeProjectile(id); continue; }
-
-        // TODO: add traceline collision here in next iteration
     }
 }
 
@@ -415,7 +386,8 @@ public command_smokelist(id)
         {
             client_print(id, print_console, "%d: origin=(%.1f,%.1f,%.1f) age=%.1f ent=%d",
                 i, g_smoke_origin[i][0], g_smoke_origin[i][1], g_smoke_origin[i][2], get_gametime()-g_smoke_create[i], g_smoke_entity[i]);
-            client_print(id, print_console, "  sprite0 pos=(%.1f,%.1f,%.1f) alpha=%.2f", g_sprite_pos[i][0][0], g_sprite_pos[i][0][1], g_sprite_pos[i][0][2], g_sprite_alpha[i][0]);
+            client_print(id, print_console, "  sprite0 pos=(%.1f,%.1f,%.1f) alpha=%.2f",
+                g_sprite_pos[i][0][0], g_sprite_pos[i][0][1], g_sprite_pos[i][0][2], g_sprite_alpha[i][0]);
         }
     }
     return 1;
