@@ -1,22 +1,21 @@
 /*
     plugins/smoke_projectile.sma
-    AMX/Pawn-corrected plugin (fixes compile issues)
+    AMX/Pawn plugin - add env_sprite rendering (initial 1 sprite per smoke)
 
-    Notes on fixes applied in this commit:
-    - Corrected forward declarations to Pawn syntax (forward Name(params);)
-    - Removed unsupported preprocessor (#ifdef) usage
-    - Use random_float() directly (AMXX provides it via <amxmodx>)
-    - Ensure public function definitions match forward prototypes (no "void:")
-    - Use a fixed golden angle constant to avoid relying on sqrtf in preprocessor
+    Changes in this version:
+    - Create one env_sprite per smoke (placeholder model sprites/flare.spr)
+    - Store sprite entity IDs and update their origins in smoke_think
+    - Clean up sprite entities on expiration
+    - Keep DATA for 24 sprite positions; currently we spawn 1 visible sprite to iterate quickly
 
-    This file focuses on fixing syntactic issues so it compiles cleanly under AMX Mod X.
+    Next steps: increase visible sprites gradually (8,16,24), add per-sprite alpha/scale rendering, optimize update rates.
 */
 
 #include <amxmodx>
 #include <fakemeta>
 
 #define PLUGIN_NAME "smoke_projectile"
-#define PLUGIN_VERSION "0.5"
+#define PLUGIN_VERSION "0.6"
 
 #define MAX_PLAYERS 32
 #define MAX_SMOKES 64
@@ -68,7 +67,11 @@ new Float:g_sprite_scale[MAX_SMOKES][SPRITE_COUNT];
 new Float:g_sprite_alpha[MAX_SMOKES][SPRITE_COUNT];
 new Float:g_sprite_seed[MAX_SMOKES][SPRITE_COUNT];
 
-// Forwards (correct Pawn forward syntax)
+// Visible sprite entities (env_sprite)
+new g_smoke_sprite_ent[MAX_SMOKES][SPRITE_COUNT];
+new g_smoke_sprite_count[MAX_SMOKES]; // how many visible sprites currently spawned (we start with 1)
+
+// Forwards
 forward OnPlayerPress(id);
 forward OnPlayerRelease(id);
 forward UpdateProjectiles();
@@ -113,10 +116,13 @@ public plugin_end()
     // defensive cleanup
     for (new i = 0; i < MAX_SMOKES; i++)
     {
-        if (g_smoke_active[i] && g_smoke_entity[i] > 0)
+        if (g_smoke_active[i])
         {
-            remove_entity(g_smoke_entity[i]);
-            g_smoke_entity[i] = 0;
+            // remove visible sprite entities
+            new cnt = g_smoke_sprite_count[i];
+            for (new s = 0; s < cnt; s++) if (g_smoke_sprite_ent[i][s] > 0) { remove_entity(g_smoke_sprite_ent[i][s]); g_smoke_sprite_ent[i][s] = 0; }
+
+            if (g_smoke_entity[i] > 0) { remove_entity(g_smoke_entity[i]); g_smoke_entity[i] = 0; }
         }
         g_smoke_active[i] = false;
     }
@@ -188,7 +194,7 @@ public ExplodeProjectile(id)
     return 1;
 }
 
-// Create smoke data and thinker entity
+// Create smoke data and thinker entity (and spawn initial visible env_sprite)
 public CreateSmokeAt(Float:ox, Float:oy, Float:oz, owner)
 {
     new slot = -1;
@@ -223,6 +229,25 @@ public CreateSmokeAt(Float:ox, Float:oy, Float:oz, owner)
         g_sprite_pos[slot][s][0] = ox;
         g_sprite_pos[slot][s][1] = oy;
         g_sprite_pos[slot][s][2] = oz;
+        g_smoke_sprite_ent[slot][s] = 0; // clear any previous
+    }
+
+    // spawn single env_sprite as visible test
+    new entSprite = create_entity("env_sprite");
+    if (entSprite > 0)
+    {
+        // model - placeholder (changeable)
+        entity_set_string(entSprite, EV_SZ_model, "sprites/flare.spr");
+        new Float:spos[3]; spos[0] = ox; spos[1] = oy; spos[2] = oz;
+        entity_set_origin(entSprite, spos);
+
+        // store
+        g_smoke_sprite_ent[slot][0] = entSprite;
+        g_smoke_sprite_count[slot] = 1;
+    }
+    else
+    {
+        g_smoke_sprite_count[slot] = 0; // no visible sprites
     }
 
     // create thinker entity
@@ -235,19 +260,16 @@ public CreateSmokeAt(Float:ox, Float:oy, Float:oz, owner)
     }
 
     entity_set_string(ent, EV_SZ_classname, "valorant_smoke");
-
-    new Float:entOrigin[3];
-    entOrigin[0] = ox; entOrigin[1] = oy; entOrigin[2] = oz;
+    new Float:entOrigin[3]; entOrigin[0] = ox; entOrigin[1] = oy; entOrigin[2] = oz;
     entity_set_origin(ent, entOrigin);
-
     entity_set_float(ent, EV_FL_nextthink, get_gametime() + SMOKE_THINK_INTERVAL);
     g_smoke_entity[slot] = ent;
 
-    server_print("[smoke] Spawned smoke slot %d at (%.1f, %.1f, %.1f)", slot, ox, oy, oz);
+    server_print("[smoke] Spawned smoke slot %d at (%.1f, %.1f, %.1f) with %d visible sprites", slot, ox, oy, oz, g_smoke_sprite_count[slot]);
     return slot;
 }
 
-// Fibonacci sphere generators (uses golden angle constant)
+// Fibonacci sphere generators
 public GenerateFibonacci(slot, count)
 {
     new Float:phi = 2.399963229728653; // golden angle
@@ -257,7 +279,7 @@ public GenerateFibonacci(slot, count)
     for (new k = 0; k < count; k++)
     {
         new Float:idx = float(k);
-        new Float:z = 1.0 - (2.0 * idx) / den; // from 1 to -1
+        new Float:z = 1.0 - (2.0 * idx) / den;
         new Float:r = floatsqroot(max_f(0.0, 1.0 - z*z));
         new Float:theta = phi * idx;
         new Float:x = r * floatcos(theta);
@@ -268,7 +290,7 @@ public GenerateFibonacci(slot, count)
     }
 }
 
-// smoke_think: updates all sprite DATA for the smoke, does Expand/Breath/Fade, cleanup
+// smoke_think: updates sprite DATA and visible env_sprite origins
 public smoke_think(ent)
 {
     if (!is_valid_ent(ent)) return;
@@ -285,6 +307,11 @@ public smoke_think(ent)
 
     if (now >= g_smoke_expire[slot])
     {
+        // remove visible sprites
+        new cnt = g_smoke_sprite_count[slot];
+        for (new s = 0; s < cnt; s++) if (g_smoke_sprite_ent[slot][s] > 0) { remove_entity(g_smoke_sprite_ent[slot][s]); g_smoke_sprite_ent[slot][s] = 0; }
+
+        // remove thinker
         remove_entity(ent);
         for (new s = 0; s < SPRITE_COUNT; s++)
         {
@@ -297,6 +324,7 @@ public smoke_think(ent)
         }
         g_smoke_active[slot] = false;
         g_smoke_entity[slot] = 0;
+        g_smoke_sprite_count[slot] = 0;
         server_print("[smoke] Slot %d expired and cleaned.", slot);
         return;
     }
@@ -319,6 +347,7 @@ public smoke_think(ent)
 
     new Float:breath = g_smoke_breath_amp[slot] * floatsin(age * g_smoke_breath_speed[slot]);
 
+    // update sprite DATA
     for (new s = 0; s < SPRITE_COUNT; s++)
     {
         new Float:seed = g_sprite_seed[slot][s];
@@ -334,6 +363,17 @@ public smoke_think(ent)
         g_sprite_pos[slot][s][2] = g_smoke_origin[slot][2] + dz * dist;
 
         g_sprite_alpha[slot][s] = 0.9 * fade;
+    }
+
+    // update visible env_sprite entities (only for spawned count)
+    new cnt = g_smoke_sprite_count[slot];
+    for (new s = 0; s < cnt; s++)
+    {
+        new entSpr = g_smoke_sprite_ent[slot][s];
+        if (entSpr <= 0) continue;
+        new Float:pos[3]; pos[0] = g_sprite_pos[slot][s][0]; pos[1] = g_sprite_pos[slot][s][1]; pos[2] = g_sprite_pos[slot][s][2];
+        entity_set_origin(entSpr, pos);
+        // note: setting alpha/scale on env_sprite may require different keyvalues; left for next iteration
     }
 
     entity_set_float(ent, EV_FL_nextthink, now + SMOKE_THINK_INTERVAL);
