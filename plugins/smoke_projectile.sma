@@ -92,6 +92,14 @@ stock Float:Clamp(Float:v, Float:lo, Float:hi)
     return v;
 }
 
+// Simple ServerEcho helper to print plugin load message
+stock ServerEcho(const pluginname[], const version[])
+{
+    new sz[128];
+    format(sz, charsmax(sz), "%s v%s loaded.", pluginname, version);
+    server_cmd("echo %s", sz);
+}
+
 public plugin_init()
 {
     register_clcmd("+smoke", "OnPlayerPress");
@@ -102,7 +110,8 @@ public plugin_init()
     // register thinker name (best-effort; some builds require it)
     register_think("valorant_smoke", "smoke_think");
 
-    log_event(true, PLUGIN_NAME " v" PLUGIN_VERSION " loaded.");
+    // safe server message instead of log_event (not available in some AMXX builds)
+    ServerEcho(PLUGIN_NAME, PLUGIN_VERSION);
 }
 
 public plugin_end()
